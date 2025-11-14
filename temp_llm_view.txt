@@ -1,0 +1,119 @@
+﻿"""LLM 鎻愪緵鏂瑰疄鐜般€?""
+
+from __future__ import annotations
+
+import json
+import os
+import textwrap
+from abc import ABC, abstractmethod
+from typing import Iterable, List
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - 浠呭湪鏈畨瑁?openai 鏃惰Е鍙?    OpenAI = None  # type: ignore
+
+from .utils_text import sanitize_for_prompt
+
+
+class BaseProvider(ABC):
+    """缁熶竴鐨勯棶绛旂敓鎴愭帴鍙ｃ€?""
+
+    @abstractmethod
+    def name(self) -> str:  # noqa: D401
+        """杩斿洖鎻愪緵鏂瑰悕绉般€?""
+
+    @abstractmethod
+    def generate(self, chunk: str, max_questions: int) -> List[dict]:
+        """杈撳叆鏂囨湰鐗囨锛岃繑鍥為棶绛斿鍒楄〃銆?""
+
+
+class OpenAIProvider(BaseProvider):
+    def __init__(
+        self,
+        model: str = "gpt-4o-mini",
+        api_key: str | None = None,
+        temperature: float = 0.2,
+    ) -> None:
+        if OpenAI is None:
+            raise RuntimeError("鏈畨瑁?openai 搴擄紝璇峰厛 pip install openai")
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("缂哄皯 OPENAI_API_KEY锛屾棤娉曡皟鐢?OpenAI 妯″瀷")
+        self.client = OpenAI(api_key=self.api_key)
+        self.model = model
+        self.temperature = temperature
+
+    def name(self) -> str:
+        return "openai"
+
+    def _build_prompt(self, chunk: str, max_questions: int) -> str:
+        instructions = textwrap.dedent(
+            f"""
+            浣犳槸璧勬繁鏁版嵁鏍囨敞鍛橈紝璇峰熀浜庝互涓嬫枃妗ｅ唴瀹圭敓鎴愰珮璐ㄩ噺闂瓟瀵广€?            - 杈撳嚭 JSON 鏁扮粍锛屾瘡涓厓绱犲寘鍚?input 鍜?ground_truth 瀛楁銆?            - 鎵€鏈夊洖绛旂敤涓枃銆?            - 闂瑕佸叿浣撱€佽兘澶熼€氳繃缁欏畾鏂囨湰鍥炵瓟銆?            - 鑷冲鐢熸垚 {max_questions} 鏉°€?            鏂囨。鍐呭锛?            {sanitize_for_prompt(chunk, 3200)}
+            """
+        ).strip()
+        return instructions
+
+    def generate(self, chunk: str, max_questions: int) -> List[dict]:
+        prompt = self._build_prompt(chunk, max_questions)
+        response = self.client.responses.create(
+            model=self.model,
+            input=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+        )
+        text = response.output_text
+        return _parse_json_pairs(text)
+
+
+class DummyProvider(BaseProvider):
+    """绂荤嚎鍗犱綅瀹炵幇锛屼究浜庢棤 Key 鐜娴嬭瘯銆?""
+
+    def __init__(self) -> None:
+        pass
+
+    def name(self) -> str:
+        return "dummy"
+
+    def generate(self, chunk: str, max_questions: int) -> List[dict]:
+        chunk = sanitize_for_prompt(chunk, 600)
+        pairs = []
+        summary = chunk[:200].replace("\n", " ")
+        for idx in range(max_questions):
+            question = f"鏍规嵁鏂囨。鍐呭绗?{idx + 1} 鏉¤鐐规槸浠€涔堬紵"
+            answer = f"绗?{idx + 1} 鏉¤鐐规杩帮細{summary}"
+            pairs.append({"input": question, "ground_truth": answer})
+        return pairs
+
+
+def create_provider(name: str, **kwargs) -> BaseProvider:
+    name = name.lower()
+    if name == "openai":
+        return OpenAIProvider(**kwargs)
+    if name == "dummy":
+        return DummyProvider()
+    raise ValueError(f"鏈煡 provider: {name}")
+
+
+def _parse_json_pairs(raw: str) -> List[dict]:
+    """灏濊瘯瑙ｆ瀽 JSON 鏁扮粍锛岃嚜鍔ㄦ竻鐞嗗洿鏍忕鍙枫€?""
+    candidate = raw.strip()
+    if candidate.startswith("```"):
+        candidate = "\n".join(line for line in candidate.splitlines() if not line.startswith("```"))
+    start = candidate.find("[")
+    end = candidate.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        candidate = candidate[start : end + 1]
+    try:
+        data = json.loads(candidate)
+        if isinstance(data, list):
+            return [
+                {
+                    "input": (item.get("input") or "").strip(),
+                    "ground_truth": (item.get("ground_truth") or "").strip(),
+                }
+                for item in data
+                if isinstance(item, dict)
+            ]
+    except json.JSONDecodeError:
+        pass
+    return []
